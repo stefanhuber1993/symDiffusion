@@ -1,0 +1,4 @@
+python3 generate.py --group p6 --prompt "a tessellation of birds and fish, M.C. Escher style, interlocking creatures,
+  flat design" --seed 42 --steps 50 --guidance-scale 5.0 --width 512 --output experiments/p6_final.png --tiled-output
+  experiments/p6_final_tiled.png
+claude --dangerously-skip-permissions
