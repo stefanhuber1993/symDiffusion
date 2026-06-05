@@ -174,10 +174,13 @@ class SymmetricDiffusionPipeline:
     def _bandpass_noise(
         noise: torch.Tensor, target_freq: float, bandwidth: float
     ) -> torch.Tensor:
-        """Apply a Gaussian bandpass filter in Fourier space to bias spatial scale.
+        """Apply a frequency filter in Fourier space to shape the noise spectrum.
 
-        target_freq: peak frequency in cycles per latent pixel (e.g. 0.08 for
-            features spanning ~12 pixels).  0 = DC (no filter).
+        target_freq=0: Gaussian low-pass (passes large-scale features, kills
+            high-freq detail).  bandwidth = sigma of the low-pass rolloff.
+        target_freq>0: Bandpass ring at target_freq (selects a specific scale).
+            NOTE: bandpass rings create per-channel correlated blobs that the
+            VAE decoder renders as large colorful tiles — prefer low-pass (0).
         bandwidth: Gaussian sigma in frequency units (0.03–0.1 typical).
         """
         B, C, H, W = noise.shape
@@ -198,6 +201,38 @@ class SymmetricDiffusionPipeline:
         if std > 1e-8:
             noise = noise / std
         return noise
+
+    @staticmethod
+    def _lowpass_noise(noise: torch.Tensor, sigma: float) -> torch.Tensor:
+        """Gaussian low-pass via spatial-domain blur (no FFT ring artifacts).
+
+        sigma: blur radius in latent pixels. Larger = smoother, more large-scale
+            features. Typical: 2–8 latent px (= 16–64 pixel features).
+        Result is renormalized to unit std.
+        """
+        import torch.nn.functional as F
+        B, C, H, W = noise.shape
+        dtype = noise.dtype
+
+        # Build separable 1-D Gaussian kernel
+        radius = int(3 * sigma + 0.5)
+        size = 2 * radius + 1
+        x = torch.arange(size, dtype=torch.float32, device=noise.device) - radius
+        kernel_1d = torch.exp(-0.5 * (x / sigma) ** 2)
+        kernel_1d = kernel_1d / kernel_1d.sum()
+
+        # Apply as two separable 2-D convolutions (horizontal then vertical)
+        k_h = kernel_1d.view(1, 1, 1, size).expand(C, 1, 1, size)
+        k_v = kernel_1d.view(1, 1, size, 1).expand(C, 1, size, 1)
+        n = noise.float()
+        n = F.conv2d(n, k_h, padding=(0, radius), groups=C)
+        n = F.conv2d(n, k_v, padding=(radius, 0), groups=C)
+
+        n = n.to(dtype)
+        std = n.std()
+        if std > 1e-8:
+            n = n / std
+        return n
 
     def _make_symmetric_noise(
         self, shape: tuple, sym_map: SymmetryMap,
@@ -270,7 +305,12 @@ class SymmetricDiffusionPipeline:
         seed: int | None = None,
         symmetrize_noise_pred: bool = True,
         symmetrize_fraction: float = 1.0,
+        symmetrize_start_fraction: float = 0.0,
         symmetrize_every_n: int = 1,
+        symmetric_noise: bool = True,
+        noise_init_image: "Image.Image | None" = None,
+        noise_init_blend: float = 0.3,
+        noise_lowpass_sigma: float = 0.0,
         noise_target_freq: float = 0.0,
         noise_freq_bandwidth: float = 0.04,
         noise_bandpass_alpha: float = 1.0,
@@ -293,14 +333,25 @@ class SymmetricDiffusionPipeline:
             aspect_ratio: Override for |a2|/|a1| ratio. If None, uses the
                 group's default. Only meaningful when height is None.
             seed: Random seed for reproducibility.
-            symmetrize_fraction: Fraction of (early) denoising steps to apply
-                symmetrization. 1.0 = all steps (exact symmetry). 0.6 = only
-                first 60% of steps, then free generation for detail. Smaller
-                values give sharper details but looser symmetry.
-            symmetrize_every_n: Within the symmetric phase, only symmetrize
+            symmetrize_fraction: Fraction of (total) denoising steps to apply
+                symmetrization. 1.0 = symmetrize through all steps. Combined
+                with symmetrize_start_fraction to define the active window.
+            symmetrize_start_fraction: Fraction of steps to skip at the START
+                before enabling symmetrization. 0.1 = first 10% of steps run
+                free (large-scale structure forms), then symmetrize. Default 0.
+            symmetrize_every_n: Within the symmetric window, only symmetrize
                 every N steps. Default 1 (every step). Higher values reduce
-                cumulative bilinear blur (key issue for hex groups) while
-                still correcting symmetry drift.
+                cumulative bilinear blur while still correcting symmetry drift.
+            symmetric_noise: If True (default), generate initial noise that is
+                already symmetric (copy asymmetric unit to all orbits). If False,
+                use plain Gaussian noise — the model has to establish symmetry
+                from scratch via per-step enforcement.
+            noise_init_image: Optional PIL image to blend into the initial latent
+                as a structural hint. The image is encoded with the VAE and mixed
+                with the Gaussian noise at weight noise_init_blend. Useful for
+                biasing large-scale feature placement (blobs, circles, etc.).
+            noise_init_blend: Blend weight for noise_init_image (0=pure noise,
+                1=pure encoded image). Default 0.3. Mixture is renormalized.
             noise_target_freq: If > 0, bandpass-filter the initial noise to
                 bias feature scale. In cycles/latent-pixel; e.g. 0.08 for
                 features ~12 latents wide. 0 = white noise (default).
@@ -367,17 +418,55 @@ class SymmetricDiffusionPipeline:
 
         self._bandpass_alpha = noise_bandpass_alpha
         self._use_nn_symmetrize = use_nn_symmetrize
-        latents = self._make_symmetric_noise(
-            (1, self.pipe.unet.config.in_channels, latent_h, latent_w),
-            sym_map, generator, self.pipe.unet.dtype, device,
-            target_freq=noise_target_freq, freq_bandwidth=noise_freq_bandwidth,
-        )
+
+        noise_shape = (1, self.pipe.unet.config.in_channels, latent_h, latent_w)
+        if symmetric_noise:
+            latents = self._make_symmetric_noise(
+                noise_shape, sym_map, generator, self.pipe.unet.dtype, device,
+                target_freq=noise_target_freq, freq_bandwidth=noise_freq_bandwidth,
+            )
+        else:
+            latents = torch.randn(noise_shape, generator=generator,
+                                  dtype=self.pipe.unet.dtype).to(device)
+            if noise_target_freq > 0.0:
+                bp = self._bandpass_noise(latents.clone(), noise_target_freq,
+                                          noise_freq_bandwidth)
+                alpha = noise_bandpass_alpha
+                latents = (1 - alpha) * latents + alpha * bp
+                std = latents.std()
+                if std > 1e-8:
+                    latents = latents / std
+
+        # Spatial Gaussian low-pass: blur each latent channel independently.
+        # Creates large-scale correlated noise without FFT ring artifacts.
+        if noise_lowpass_sigma > 0.0:
+            latents = self._lowpass_noise(latents, noise_lowpass_sigma)
+
+        # Optionally blend a pixel-space seed image into the initial latent.
+        # The image is encoded with the VAE and added at weight noise_init_blend,
+        # then the mixture is renormalized to unit std so the scheduler scale
+        # is correct. This acts as a "soft structural hint" at t=T_max.
+        if noise_init_image is not None:
+            img_t = noise_init_image.convert("RGB").resize(
+                (width, height), Image.LANCZOS
+            )
+            img_arr = np.array(img_t).astype(np.float32) / 127.5 - 1.0
+            img_tensor = torch.from_numpy(img_arr).permute(2, 0, 1).unsqueeze(0)
+            img_tensor = img_tensor.to(device=device, dtype=self.pipe.unet.dtype)
+            encoded = self.pipe.vae.encode(img_tensor).latent_dist.sample()
+            encoded = encoded * self.pipe.vae.config.scaling_factor
+            blend = noise_init_blend
+            latents = (1 - blend) * latents + blend * encoded
+            std = latents.std()
+            if std > 1e-8:
+                latents = latents / std
 
         # Set up scheduler
         self.pipe.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.pipe.scheduler.timesteps
         latents = latents * self.pipe.scheduler.init_noise_sigma
 
+        sym_start = int(num_inference_steps * symmetrize_start_fraction)
         sym_cutoff = int(num_inference_steps * symmetrize_fraction)
 
         # For debugging: track intermediate latents
@@ -396,7 +485,7 @@ class SymmetricDiffusionPipeline:
 
         # Denoising loop
         for step_idx, t in enumerate(timesteps):
-            do_sym = (step_idx < sym_cutoff) and (step_idx % symmetrize_every_n == 0)
+            do_sym = (step_idx >= sym_start) and (step_idx < sym_cutoff) and (step_idx % symmetrize_every_n == 0)
             do_pixel_sym = pixel_space_symmetrize and (step_idx % pixel_symmetrize_every_n == 0)
 
             # Pixel-space symmetrization: decode → symmetrize → encode

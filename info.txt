@@ -1,4 +1,2 @@
-python3 generate.py --group p6 --prompt "a tessellation of birds and fish, M.C. Escher style, interlocking creatures,
-  flat design" --seed 42 --steps 50 --guidance-scale 5.0 --width 512 --output experiments/p6_final.png --tiled-output
-  experiments/p6_final_tiled.png
+python3 generate.py --group pg --prompt "red and blue fish, tightly intertwined, 3d rendering, detailled" --seed 42 --steps 50 --guidance-scale 7.5 --width 512 --output-dir experiments
 claude --dangerously-skip-permissions
