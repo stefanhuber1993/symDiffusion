@@ -6,21 +6,54 @@ Two key modifications to the diffusion process:
 1. **Circular padding** on all Conv2d layers → periodic boundary conditions → seamless tiling
 2. **Symmetry enforcement** during denoising → wallpaper group symmetry within each tile
 
+## >>> START HERE: current status (handoff 2026-10-07) <<<
+Two samplers exist. **Active work is on the new view-based "plane sampler"**:
+- `symmetric_diffusion/view_sampler.py` + runner `run_views.py`
+- Full rationale, results and next steps: **`docs/view_based_sampler.md`** — read it first.
+- Key images (experiments/ is gitignored): `docs/img/`.
+
+State of play:
+- v3 (`pipeline.py`, below) works but hex groups are generated sheared, motifs are tiny,
+  and results are flat/saturated. The plane sampler fixes the geometry (exact symmetry,
+  unsheared hex, cell size decoupled from UNet resolution).
+- Best plane-sampler result so far: `--mode hybrid --switch 0.5` (x0-mode layout with
+  fresh i.i.d. noise for 50% of steps, then symmetric re-noise + eps mode). Natural colours,
+  interlocking red/blue shapes, but no recognisable fish yet.
+- **Immediate next steps** (from the doc): sweep `--switch` 0.35–0.45, 50 steps, stronger
+  object prompts, then hex groups (p3/p6), which this sampler now renders unsheared.
+
+Hardware notes:
+- Previous machine was a 16 GB Apple Silicon Mac: UNet calls had to stay at batch 2
+  (one view + CFG); batch 8 (4 views × CFG) went into swap. That's why `view_sampler.py`
+  loops over views one at a time — on a bigger machine, batching all K views into one
+  UNet call (batch 2K) is an easy speed-up.
+- fp16 VAE decode at ≥768 px gave NaN on MPS → `_render` decodes in fp32. On 16 GB,
+  `--render 128` (1024 px) thrashed; `--render 96` was used.
+- ~1 s per UNet call on the old Mac; 4 views × 25 steps ≈ 2 min/image.
+- Old env: Python 3.12.2 (pyenv), torch 2.11.0, diffusers 0.37.1, transformers 5.9.0.
+  Fresh setup: `pip install -r requirements.txt`, then HF login (see Running).
+
 ## Project structure
 ```
 symmetric_diffusion/          # Main package
   wallpaper_groups.py         # All 17 wallpaper groups defined in fractional coordinates
   symmetrize.py               # Orbit-based (rect/square) + direct averaging (hex) symmetrization
   circular_padding.py         # Monkey-patches Conv2d to use circular padding
-  pipeline.py                 # Modified StableDiffusionPipeline wrapper
+  pipeline.py                 # v3: Modified StableDiffusionPipeline wrapper (unit-cell denoising)
+  view_sampler.py             # NEW: view-based plane sampler (see docs/view_based_sampler.md)
   schedule.py                 # Strength schedule parser (historical, not currently used)
-generate.py                   # CLI entry point
+generate.py                   # CLI entry point (v3 pipeline)
+run_views.py                  # CLI runner for the plane sampler
 test_symmetry.py              # Math tests (no GPU/model needed)
-run_experiments.py             # Batch experiment runner
-run_comparison.py              # ON/OFF noise pred comparison
-run_soft.py                    # Soft symmetry ablation
-run_groups2.py                 # Glide/rotation group experiments
-experiments/                   # Output images from experiments
+docs/                         # Design notes + key result images (docs/img/)
+experiments/                  # Output images (gitignored, not in repo)
+
+# v3 experiment scripts (historical, see "v3 tuning experiments" below)
+run_experiments.py, run_comparison.py, run_soft.py, run_groups2.py,
+run_timing_grid.py, run_nosym_noise_grid.py, run_noise_init_grid.py,
+run_gentle_hint_grid.py, run_everyn_sweep.py, run_groups_best_config.py,
+run_step_comparison.py, debug_p1_vs_pg.py,
+test_pixel_space_symmetry.py, test_pixel_symmetry_per_step.py  # pixel-space symmetrisation tests (need GPU)
 ```
 
 ## Running
@@ -31,6 +64,9 @@ python3 test_symmetry.py
 # Generate (requires HuggingFace login: python3 -c "from huggingface_hub import login; login()")
 python3 generate.py --prompt "a tessellation of birds" --group p6 --seed 42
 python3 generate.py --list-groups  # show all 17 groups with computed heights
+
+# Plane sampler (current work) — best config so far
+python3 run_views.py --groups p4 --cell 80 --views 4 --steps 25 --mode hybrid --switch 0.5 --render 96
 
 # CLI options for lattice geometry:
 #   --width 512          Base width (default 512)
@@ -167,6 +203,16 @@ parallelogram tiling (each row shifted by half a tile width).
 The pgg group had the 180° rotation at the wrong center — (0,0) instead of (1/4,1/4).
 This made the operations non-closed and generated an order-8 group instead of order-4.
 Fixed to `(-u+0.5, -v+0.5)`. Caught by the group closure test.
+
+### v3 tuning experiments (2026-06)
+Grid scripts (`run_timing_grid.py` → `run_nosym_noise_grid.py` → `run_gentle_hint_grid.py`,
+`run_everyn_sweep.py`, `run_groups_best_config.py`) added these `pipeline.py` options:
+`symmetric_noise`, `symmetrize_start_fraction`, `symmetrize_every_n`, `noise_lowpass_sigma`,
+`noise_init_image`/`noise_init_blend`. Per the script docstrings, the winning config was
+**plain (non-symmetric) initial noise + symmetrize every 3 steps + skip first 10% of steps**,
+i.e. letting large-scale structure form before enforcing symmetry. FFT bandpass noise
+creates coloured blob tiles — prefer spatial low-pass. This foreshadows the plane
+sampler finding that symmetric noise at high noise levels is what causes saturation.
 
 ## Open questions / future work
 - Try fine-tuned models (LoRA trained on Escher/pattern art) which might handle symmetry better
